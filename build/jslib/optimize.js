@@ -274,6 +274,21 @@ function (lang,   logger,   envOptimize,        file,           parse,
                     fileContents = fileContents.replace(/(\r\n)+/g, "\r\n");
                     fileContents = fileContents.replace(/(\n)+/g, "\n");
                 }
+				//Remove white spaces.
+				fileContents = fileContents.replace(/\: /g, ':');
+				fileContents = fileContents.replace(/\; /g, ';');
+				fileContents = fileContents.replace(/ {/g, '{');
+				fileContents = fileContents.replace(/, /g, ',');
+				
+				//Remove unnecessary ; ({display: block;} -> {display:block}).
+				fileContents = fileContents.replace(/\;}/g, '}');
+				
+				//Replace colors with shorthands (#FFFFFF -> #FFF).
+				fileContents = fileContents.replace(/\#([0-9A-F])\1([0-9A-F])\2([0-9A-F])\3/gi, '#$1$2$3');
+				
+				//Replace 0px and 0% with 0.
+				fileContents = fileContents.replace(/ 0px/gi, '0');
+				fileContents = fileContents.replace(/\:0px/gi, '0');
             } catch (e) {
                 fileContents = originalFileContents;
                 logger.error("Could not optimized CSS file: " + fileName + ", error: " + e);

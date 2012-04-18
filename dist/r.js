@@ -1,5 +1,5 @@
 /**
- * @license r.js 1.0.7+ Fri, 30 Mar 2012 00:24:35 GMT Copyright (c) 2010-2012, The Dojo Foundation All Rights Reserved.
+ * @license r.js 1.0.7+ Copyright (c) 2010-2012, The Dojo Foundation All Rights Reserved.
  * Available via the MIT or new BSD license.
  * see: http://github.com/jrburke/requirejs for details
  */
@@ -20,7 +20,7 @@ var requirejs, require, define;
 
     var fileName, env, fs, vm, path, exec, rhinoContext, dir, nodeRequire,
         nodeDefine, exists, reqMain, loadedOptimizedLib,
-        version = '1.0.7+ Fri, 30 Mar 2012 00:24:35 GMT',
+        version = '1.0.7+',
         jsSuffixRegExp = /\.js$/,
         commandOption = '',
         useLibLoaded = {},
@@ -8081,6 +8081,21 @@ function (lang,   logger,   envOptimize,        file,           parse,
                     fileContents = fileContents.replace(/(\r\n)+/g, "\r\n");
                     fileContents = fileContents.replace(/(\n)+/g, "\n");
                 }
+				//Remove white spaces.
+				fileContents = fileContents.replace(/\: /g, ':');
+				fileContents = fileContents.replace(/\; /g, ';');
+				fileContents = fileContents.replace(/ {/g, '{');
+				fileContents = fileContents.replace(/, /g, ',');
+				
+				//Remove unnecessary ; ({display: block;} -> {display:block}).
+				fileContents = fileContents.replace(/\;}/g, '}');
+				
+				//Replace colors with shorthands (#FFFFFF -> #FFF).
+				fileContents = fileContents.replace(/\#([0-9A-F])\1([0-9A-F])\2([0-9A-F])\3/gi, '#$1$2$3');
+				
+				//Replace 0px and 0% with 0.
+				fileContents = fileContents.replace(/ 0px/gi, '0');
+				fileContents = fileContents.replace(/\:0px/gi, '0');
             } catch (e) {
                 fileContents = originalFileContents;
                 logger.error("Could not optimized CSS file: " + fileName + ", error: " + e);
