@@ -279,6 +279,8 @@ function (lang,   logger,   envOptimize,        file,           parse,
 				fileContents = fileContents.replace(/\; /g, ';');
 				fileContents = fileContents.replace(/ {/g, '{');
 				fileContents = fileContents.replace(/, /g, ',');
+				fileContents = fileContents.replace(/ >/g, '>');
+				fileContents = fileContents.replace(/> /g, '>');
 				
 				//Remove unnecessary ; ({display: block;} -> {display:block}).
 				fileContents = fileContents.replace(/\;}/g, '}');
@@ -289,6 +291,12 @@ function (lang,   logger,   envOptimize,        file,           parse,
 				//Replace 0px and 0% with 0.
 				fileContents = fileContents.replace(/ 0px/gi, '0');
 				fileContents = fileContents.replace(/\:0px/gi, '0');
+				fileContents = fileContents.replace(/ 0%/gi, '0');
+				fileContents = fileContents.replace(/\:0%/gi, '0');
+				
+				//Replace 'bold' and 'normal' with their number equvalents
+				fileContents = fileContents.replace(/bold/gi, '700');
+				fileContents = fileContents.replace(/normal/gi, '400');
             } catch (e) {
                 fileContents = originalFileContents;
                 logger.error("Could not optimized CSS file: " + fileName + ", error: " + e);
