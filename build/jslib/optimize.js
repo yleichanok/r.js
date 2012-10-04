@@ -4,16 +4,18 @@
  * see: http://github.com/jrburke/requirejs for details
  */
 
-/*jslint plusplus: false, nomen: false, regexp: false */
+/*jslint plusplus: true, nomen: true, regexp: true */
 /*global define: false */
 
 define([ 'lang', 'logger', 'env!env/optimize', 'env!env/file', 'parse',
          'pragma', 'uglifyjs/index'],
 function (lang,   logger,   envOptimize,        file,           parse,
           pragma, uglify) {
+    'use strict';
 
     var optimize,
         cssImportRegExp = /\@import\s+(url\()?\s*([^);]+)\s*(\))?([\w, ]*)(;)?/g,
+        cssCommentImportRegExp = /\/\*[^\*]*@import[^\*]*\*\//g,
         cssUrlRegExp = /\url\(\s*([^\)]+)\s*\)?/g;
 
     /**
@@ -50,7 +52,11 @@ function (lang,   logger,   envOptimize,        file,           parse,
             //If no slash, so must be just a file name. Use empty string then.
             filePath = (endIndex !== -1) ? fileName.substring(0, endIndex + 1) : "",
             //store a list of merged files
-            importList = [];
+            importList = [],
+            skippedList = [];
+
+        //First make a pass by removing an commented out @import calls.
+        fileContents = fileContents.replace(cssCommentImportRegExp, '');
 
         //Make sure we have a delimited ignore list to make matching faster
         if (cssImportIgnore && cssImportIgnore.charAt(cssImportIgnore.length - 1) !== ",") {
@@ -60,6 +66,7 @@ function (lang,   logger,   envOptimize,        file,           parse,
         fileContents = fileContents.replace(cssImportRegExp, function (fullMatch, urlStart, importFileName, urlEnd, mediaTypes) {
             //Only process media type "all" or empty media type rules.
             if (mediaTypes && ((mediaTypes.replace(/^\s\s*/, '').replace(/\s\s*$/, '')) !== "all")) {
+                skippedList.push(fileName);
                 return fullMatch;
             }
 
@@ -93,6 +100,9 @@ function (lang,   logger,   envOptimize,        file,           parse,
 
                 if (flat.importList.length) {
                     importList.push.apply(importList, flat.importList);
+                }
+                if (flat.skippedList.length) {
+                    skippedList.push.apply(skippedList, flat.skippedList);
                 }
 
                 //Make the full import path
@@ -133,7 +143,7 @@ function (lang,   logger,   envOptimize,        file,           parse,
                         }
                     }
 
-                    return "url(\"" + parts.join("/") + "\")";
+                    return "url(" + parts.join("/") + ")";
                 });
 
                 importList.push(fullImportFileName);
@@ -146,37 +156,32 @@ function (lang,   logger,   envOptimize,        file,           parse,
 
         return {
             importList : importList,
+            skippedList: skippedList,
             fileContents : fileContents
         };
     }
 
     optimize = {
-        licenseCommentRegExp: /\/\*[\s\S]*?\*\//g,
-
         /**
          * Optimizes a file that contains JavaScript content. Optionally collects
          * plugin resources mentioned in a file, and then passes the content
          * through an minifier if one is specified via config.optimize.
          *
          * @param {String} fileName the name of the file to optimize
+         * @param {String} fileContents the contents to optimize. If this is
+         * a null value, then fileName will be used to read the fileContents.
          * @param {String} outFileName the name of the file to use for the
          * saved optimized content.
          * @param {Object} config the build config object.
-         * @param {String} [moduleName] the module name to use for the file.
-         * Used for plugin resource collection.
          * @param {Array} [pluginCollector] storage for any plugin resources
          * found.
          */
-        jsFile: function (fileName, outFileName, config, moduleName, pluginCollector) {
-            var parts = (config.optimize + "").split('.'),
-                optimizerName = parts[0],
-                keepLines = parts[1] === 'keepLines',
-                fileContents;
+        jsFile: function (fileName, fileContents, outFileName, config, pluginCollector) {
+            if (!fileContents) {
+                fileContents = file.readFile(fileName);
+            }
 
-            fileContents = file.readFile(fileName);
-
-            fileContents = optimize.js(fileName, fileContents, optimizerName,
-                                       keepLines, config, pluginCollector);
+            fileContents = optimize.js(fileName, fileContents, config, pluginCollector);
 
             file.saveUtf8File(outFileName, fileContents);
         },
@@ -189,16 +194,16 @@ function (lang,   logger,   envOptimize,        file,           parse,
          * @param {String} fileName the name of the file that matches the
          * fileContents.
          * @param {String} fileContents the string of JS to optimize.
-         * @param {String} [optimizerName] optional name of the optimizer to
-         * use. 'uglify' is default.
-         * @param {Boolean} [keepLines] whether to keep line returns in the optimization.
          * @param {Object} [config] the build config object.
          * @param {Array} [pluginCollector] storage for any plugin resources
          * found.
          */
-        js: function (fileName, fileContents, optimizerName, keepLines, config, pluginCollector) {
-            var licenseContents = '',
-                optFunc, match, comment;
+        js: function (fileName, fileContents, config, pluginCollector) {
+            var parts = (String(config.optimize)).split('.'),
+                optimizerName = parts[0],
+                keepLines = parts[1] === 'keepLines',
+                licenseContents = '',
+                optFunc;
 
             config = config || {};
 
@@ -216,14 +221,10 @@ function (lang,   logger,   envOptimize,        file,           parse,
 
                 if (config.preserveLicenseComments) {
                     //Pull out any license comments for prepending after optimization.
-                    optimize.licenseCommentRegExp.lastIndex = 0;
-                    while ((match = optimize.licenseCommentRegExp.exec(fileContents))) {
-                        comment = match[0];
-                        //Only keep the comments if they are license comments.
-                        if (comment.indexOf('@license') !== -1 ||
-                            comment.indexOf('/*!') === 0) {
-                            licenseContents += comment + '\n';
-                        }
+                    try {
+                        licenseContents = parse.getLicenseComments(fileName, fileContents);
+                    } catch (e) {
+                        logger.error('Cannot parse file: ' + fileName + ' for comments. Skipping it. Error is:\n' + e.toString());
                     }
                 }
 
@@ -247,20 +248,38 @@ function (lang,   logger,   envOptimize,        file,           parse,
             //Read in the file. Make sure we have a JS string.
             var originalFileContents = file.readFile(fileName),
                 flat = flattenCss(fileName, originalFileContents, config.cssImportIgnore, {}),
-                fileContents = flat.fileContents,
-                startIndex, endIndex, buildText;
+                //Do not use the flattened CSS if there was one that was skipped.
+                fileContents = flat.skippedList.length ? originalFileContents : flat.fileContents,
+                startIndex, endIndex, buildText, comment;
+
+            if (flat.skippedList.length) {
+                logger.warn('Cannot inline @imports for ' + fileName +
+                            ',\nthe following files had media queries in them:\n' +
+                            flat.skippedList.join('\n'));
+            }
 
             //Do comment removal.
             try {
                 if (config.optimizeCss.indexOf(".keepComments") === -1) {
-                    startIndex = -1;
+                    startIndex = 0;
                     //Get rid of comments.
-                    while ((startIndex = fileContents.indexOf("/*")) !== -1) {
+                    while ((startIndex = fileContents.indexOf("/*", startIndex)) !== -1) {
                         endIndex = fileContents.indexOf("*/", startIndex + 2);
                         if (endIndex === -1) {
                             throw "Improper comment in CSS file: " + fileName;
                         }
-                        fileContents = fileContents.substring(0, startIndex) + fileContents.substring(endIndex + 2, fileContents.length);
+                        comment = fileContents.substring(startIndex, endIndex);
+
+                        if (config.preserveLicenseComments &&
+                            (comment.indexOf('license') !== -1 ||
+                             comment.indexOf('opyright') !== -1 ||
+                             comment.indexOf('(c)') !== -1)) {
+                            //Keep the comment, just increment the startIndex
+                            startIndex = endIndex;
+                        } else {
+                            fileContents = fileContents.substring(0, startIndex) + fileContents.substring(endIndex + 2, fileContents.length);
+                            startIndex = 0;
+                        }
                     }
                 }
                 //Get rid of newlines.
@@ -274,29 +293,6 @@ function (lang,   logger,   envOptimize,        file,           parse,
                     fileContents = fileContents.replace(/(\r\n)+/g, "\r\n");
                     fileContents = fileContents.replace(/(\n)+/g, "\n");
                 }
-                //Remove white spaces.
-                fileContents = fileContents.replace(/\: /g, ':');
-                fileContents = fileContents.replace(/\; /g, ';');
-                fileContents = fileContents.replace(/ {/g, '{');
-                fileContents = fileContents.replace(/, /g, ',');
-                fileContents = fileContents.replace(/ >/g, '>');
-                fileContents = fileContents.replace(/> /g, '>');
-                
-				//Replace 'bold' and 'normal' with their number equvalents.
-                fileContents = fileContents.replace(/font-weight:\s{0,}bold;/gi, 'font-weight:700;');
-                fileContents = fileContents.replace(/font-weight:\s{0,}normal;/gi, 'font-weight:400;');
-				
-                //Remove unnecessary ; ({display: block;} -> {display:block}).
-                fileContents = fileContents.replace(/\;}/g, '}');
-                
-                //Replace colors with shorthands (#FFFFFF -> #FFF).
-                fileContents = fileContents.replace(/\#([0-9A-F])\1([0-9A-F])\2([0-9A-F])\3/gi, '#$1$2$3');
-                
-                //Replace 0px and 0% with 0.
-                fileContents = fileContents.replace(/ 0px/gi, '0');
-                fileContents = fileContents.replace(/\:0px/gi, ':0');
-                fileContents = fileContents.replace(/ 0%/gi, '0');
-                fileContents = fileContents.replace(/\:0%/gi, ':0');
             } catch (e) {
                 fileContents = originalFileContents;
                 logger.error("Could not optimized CSS file: " + fileName + ", error: " + e);
@@ -340,7 +336,7 @@ function (lang,   logger,   envOptimize,        file,           parse,
             uglify: function (fileName, fileContents, keepLines, config) {
                 var parser = uglify.parser,
                     processor = uglify.uglify,
-                    ast;
+                    ast, errMessage, errMatch;
 
                 config = config || {};
 
@@ -348,12 +344,23 @@ function (lang,   logger,   envOptimize,        file,           parse,
 
                 try {
                     ast = parser.parse(fileContents, config.strict_semicolons);
-                    ast = processor.ast_mangle(ast, config);
+                    if (config.no_mangle !== true) {
+                        ast = processor.ast_mangle(ast, config);
+                    }
                     ast = processor.ast_squeeze(ast, config);
 
                     fileContents = processor.gen_code(ast, config);
+
+                    if (config.max_line_length) {
+                        fileContents = processor.split_lines(fileContents, config.max_line_length);
+                    }
                 } catch (e) {
-                    logger.error('Cannot uglify file: ' + fileName + '. Skipping it. Error is:\n' + e.toString());
+                    errMessage = e.toString();
+                    errMatch = /\nError(\r)?\n/.exec(errMessage);
+                    if (errMatch) {
+                        errMessage = errMessage.substring(0, errMatch.index);
+                    }
+                    logger.error('Cannot uglify file: ' + fileName + '. Skipping it. Error is:\n' + errMessage);
                 }
                 return fileContents;
             }

@@ -56,6 +56,14 @@
     //to the build file. All relative paths are relative to the build file.
     dir: "../some/path",
 
+    //As of RequireJS 2.0.2, the dir above will be deleted before the
+    //build starts again. If you have a big build and are not doing
+    //source transforms with onBuildRead/onBuildWrite, then you can
+    //set keepBuildDir to true to keep the previous dir. This allows for
+    //faster rebuilds, but it could lead to unexpected errors if the
+    //built code is transformed in some way.
+    keepBuildDir: true,
+
     //Used to inline i18n resources into the built file. If no locale
     //is specified, i18n resources will not be inlined. Only one locale
     //can be inlined for a build. Root bundles referenced by a build layer
@@ -80,7 +88,19 @@
     uglify: {
         toplevel: true,
         ascii_only: true,
-        beautify: true
+        beautify: true,
+        max_line_length: 1000,
+
+        //How to pass uglifyjs defined symbols for AST symbol replacement,
+        //see "defines" options for ast_mangle in the uglifys docs.
+        defines: {
+            DEBUG: ['name', 'false']
+        },
+
+        //Custom value supported by r.js but done differently
+        //in uglifyjs directly:
+        //Skip the processor.ast_mangle() part of the uglify call (r.js 2.0.5+)
+        no_mangle: true
     },
 
     //If using Closure Compiler for script optimization, these config options
@@ -195,6 +215,21 @@
     //together.
     skipModuleInsertion: false,
 
+    //Specify modules to stub out in the optimized file. The optimizer will
+    //use the source version of these modules for dependency tracing and for
+    //plugin use, but when writing the text into an optimized layer, these
+    //modules will get the following text instead:
+    //If the module is used as a plugin:
+    //    define({load: function(id){throw new Error("Dynamic load not allowed: " + id);}});
+    //If just a plain module:
+    //    define({});
+    //This is useful particularly for plugins that inline all their resources
+    //and use the default module resolution behavior (do *not* implement the
+    //normalize() method). In those cases, an AMD loader just needs to know
+    //that the module has a definition. These small stubs can be used instead of
+    //including the full source for a plugin.
+    stubModules: ['text', 'bar'],
+
     //If it is not a one file optimization, scan through all .js files in the
     //output directory for any plugin resource dependencies, and if the plugin
     //supports optimizing them as separate files, optimize them. Can be a
@@ -209,6 +244,10 @@
     //Introduced in 1.0.3. Previous versions incorrectly found the nested calls
     //by default.
     findNestedDependencies: false,
+
+    //If set to true, any files that were combined into a build layer will be
+    //removed from the output folder.
+    removeCombined: false,
 
     //List the modules that will be optimized. All their immediate and deep
     //dependencies will be included in the module's file when the build is
@@ -264,17 +303,50 @@
             excludeShallow: [
                 "foo/bar/bot"
             ]
+        },
+
+        //This module entry shows the use insertRequire (first available in 2.0):
+        //if the target module only calls define and does not call require()
+        //at the top level, and this build output is used with an AMD shim
+        //loader like almond, where the data-main script in the HTML page is
+        //replaced with just a script to the built file, if there is no
+        //top-level require, no modules will execute. specify insertRequire to
+        //have a require([]) call placed at the end of the file to trigger the
+        //execution of modules. More detail at
+        //https://github.com/jrburke/almond
+        //Note that insertRequire does not affect or add to the modules
+        //that are built into the build layer. It just adds a require([])
+        //call to the end of the built file for use during the runtime
+        //execution of the built code.
+        {
+            name: "foo/baz",
+            insertRequire: ["foo/baz"]
         }
     ],
 
     //If you only intend to optimize a module (and its dependencies), with
     //a single file as the output, you can specify the module options inline,
     //instead of using the 'modules' section above. 'exclude',
-    //'excludeShallow' and 'include' are all allowed as siblings to name.
-    //The name of the optimized file is specified by 'out'.
+    //'excludeShallow', 'include' and 'insertRequire' are all allowed as siblings
+    //to name. The name of the optimized file is specified by 'out'.
     name: "foo/bar/bop",
     include: ["foo/bar/bee"],
+    insertRequire: ['foo/bar/bop'],
     out: "path/to/optimized-file.js",
+
+    //An alternative to "include". Normally only used in a requirejs.config()
+    //call for a module used for mainConfigFile, since requirejs will read
+    //"deps" during runtime to do the equivalent of require(deps) to kick
+    //off some module loading.
+    deps: ["foo/bar/bee"],
+
+    //In RequireJS 2.0, "out" can be a function. For single JS file
+    //optimizations that are generated by calling requirejs.optimize(),
+    //using an out function means the optimized contents are not written to
+    //a file on disk, but instead pass to the out function:
+    out: function (text) {
+        //Do what you want with the optimized text here.
+    },
 
     //Wrap any build layer in a start and end text specified by wrap.
     //Use this to encapsulate the module code so that define/require are
@@ -297,8 +369,16 @@
     //File paths are relative to the build file, or if running a commmand
     //line build, the current directory.
     wrap: {
-        startFile: "part/start.frag",
+        startFile: "parts/start.frag",
         endFile: "parts/end.frag"
+    },
+
+    //As of r.js 2.1.0, startFile and endFile can be arrays of files, and
+    //they will all be loaded and inserted at the start or end, respectively,
+    //of the build layer.
+    wrap: {
+        startFile: ["parts/startOne.frag", "parts/startTwo.frag"],
+        endFile: ["parts/endOne.frag", "parts/endTwo.frag"]
     },
 
     //When the optimizer copies files from the source location to the
@@ -346,5 +426,30 @@
         //Always return a value.
         //This is just a contrived example.
         return contents.replace(/bar/g, 'foo');
-    }
+    },
+
+    //Introduced in 2.0.2: if set to true, then the optimizer will add a
+    //define(require, exports, module) {}); wrapper around any file that seems
+    //to use commonjs/node module syntax (require, exports) without already
+    //calling define(). This is useful to reuse modules that came from
+    //or are loadable in an AMD loader that can load commonjs style modules
+    //in development as well as AMD modules, but need to have a built form
+    //that is only AMD. Note that this does *not* enable different module
+    //ID-to-file path logic, all the modules still have to be found using the
+    //requirejs-style configuration, it does not use node's node_modules nested
+    //path lookups.
+    cjsTranslate: true,
+
+    //Introduced in 2.0.2: a bit experimental.
+    //Each script in the build layer will be turned into
+    //a JavaScript string with a //@ sourceURL comment, and then wrapped in an
+    //eval call. This allows some browsers to see each evaled script as a
+    //separate script in the script debugger even though they are all combined
+    //in the same file. Some important limitations:
+    //1) Do not use in IE if conditional comments are turned on, it will cause
+    //errors:
+    //http://en.wikipedia.org/wiki/Conditional_comment#Conditional_comments_in_JScript
+    //2) It is only useful in optimize: 'none' scenarios. The goal is to allow
+    //easier built layer debugging, which goes against minification desires.
+    useSourceUrl: true
 })

@@ -4,7 +4,7 @@
  * see: http://github.com/jrburke/requirejs for details
  */
 
-/*jslint regexp: false, strict: false */
+/*jslint regexp: false */
 /*global require: false, define: false, requirejsVars: false, process: false */
 
 /**
@@ -15,12 +15,16 @@
  */
 
 (function () {
+    'use strict';
+
     var nodeReq = requirejsVars.nodeRequire,
         req = requirejsVars.require,
         def = requirejsVars.define,
         fs = nodeReq('fs'),
         path = nodeReq('path'),
-        vm = nodeReq('vm');
+        vm = nodeReq('vm'),
+        //In Node 0.7+ existsSync is on fs.
+        exists = fs.existsSync || path.existsSync;
 
     //Supply an implementation that allows synchronous get of a module.
     req.get = function (context, moduleName, relModuleMap) {
@@ -32,20 +36,28 @@
             moduleMap = context.makeModuleMap(moduleName, relModuleMap);
 
         //Normalize module name, if it contains . or ..
-        moduleName = moduleMap.fullName;
+        moduleName = moduleMap.id;
 
-        if (moduleName in context.defined) {
+        if (context.defined.hasOwnProperty(moduleName)) {
             ret = context.defined[moduleName];
         } else {
             if (ret === undefined) {
                 //Try to dynamically fetch it.
                 req.load(context, moduleName, moduleMap.url);
-                //The above call is sync, so can do the next thing safely.
+
+                //Enable the module
+                context.enable(moduleMap, relModuleMap);
+
+                //The above calls are sync, so can do the next thing safely.
                 ret = context.defined[moduleName];
             }
         }
 
         return ret;
+    };
+
+    req.nextTick = function (fn) {
+        process.nextTick(fn);
     };
 
     //Add wrapper around the code so that it gets the requirejs
@@ -57,13 +69,10 @@
                 '\n}(requirejsVars.require, requirejsVars.requirejs, requirejsVars.define));';
     };
 
-    requirejsVars.nodeLoad = req.load = function (context, moduleName, url) {
+    req.load = function (context, moduleName, url) {
         var contents, err;
 
-        //Indicate a the module is in process of loading.
-        context.scriptCount += 1;
-
-        if (path.existsSync(url)) {
+        if (exists(url)) {
             contents = fs.readFileSync(url, 'utf8');
 
             contents = req.makeNodeWrapper(contents);
@@ -79,13 +88,18 @@
             }
         } else {
             def(moduleName, function () {
+                //Get the original name, since relative requires may be
+                //resolved differently in node (issue #202)
+                var originalName = context.registry[moduleName] &&
+                            context.registry[moduleName].map.originalName;
+
                 try {
-                    return (context.config.nodeRequire || req.nodeRequire)(moduleName);
+                    return (context.config.nodeRequire || req.nodeRequire)(originalName);
                 } catch (e) {
                     err = new Error('Calling node\'s require("' +
-                                        moduleName + '") failed with error: ' + e);
+                                        originalName + '") failed with error: ' + e);
                     err.originalError = e;
-                    err.moduleName = moduleName;
+                    err.moduleName = originalName;
                     return req.onError(err);
                 }
             });
@@ -93,8 +107,6 @@
 
         //Support anonymous modules.
         context.completeLoad(moduleName);
-
-        return undefined;
     };
 
     //Override to provide the function wrapper for define/require.
@@ -103,7 +115,4 @@
         text = req.makeNodeWrapper(text);
         return eval(text);
     };
-
-    //Hold on to the original execCb to use in useLib calls.
-    requirejsVars.nodeRequireExecCb = require.execCb;
 }());

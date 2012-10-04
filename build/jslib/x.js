@@ -1,5 +1,5 @@
 /**
- * @license r.js 1.0.7+ Copyright (c) 2010-2012, The Dojo Foundation All Rights Reserved.
+ * @license r.js 2.1.0 Copyright (c) 2010-2012, The Dojo Foundation All Rights Reserved.
  * Available via the MIT or new BSD license.
  * see: http://github.com/jrburke/requirejs for details
  */
@@ -11,7 +11,7 @@
  * the shell of the r.js file.
  */
 
-/*jslint evil: true, nomen: true */
+/*jslint evil: true, nomen: true, sloppy: true */
 /*global readFile: true, process: false, Packages: false, print: false,
 console: false, java: false, module: false, requirejsVars */
 
@@ -19,8 +19,8 @@ var requirejs, require, define;
 (function (console, args, readFileFunc) {
 
     var fileName, env, fs, vm, path, exec, rhinoContext, dir, nodeRequire,
-        nodeDefine, exists, reqMain, loadedOptimizedLib,
-        version = '1.0.7+',
+        nodeDefine, exists, reqMain, loadedOptimizedLib, existsForNode,
+        version = '2.1.0',
         jsSuffixRegExp = /\.js$/,
         commandOption = '',
         useLibLoaded = {},
@@ -70,6 +70,9 @@ var requirejs, require, define;
         fs = require('fs');
         vm = require('vm');
         path = require('path');
+        //In Node 0.7+ existsSync is on fs.
+        existsForNode = fs.existsSync || path.existsSync;
+
         nodeRequire = require;
         nodeDefine = define;
         reqMain = require.main;
@@ -89,7 +92,7 @@ var requirejs, require, define;
         };
 
         exists = function (fileName) {
-            return path.existsSync(fileName);
+            return existsForNode(fileName);
         };
 
 
@@ -170,21 +173,26 @@ var requirejs, require, define;
                 config.logLevel = config.hasOwnProperty('logLevel') ?
                                   config.logLevel : logger.SILENT;
 
+                //Reset build internals first in case this is part
+                //of a long-running server process that could have
+                //exceptioned out in a bad state. It is only defined
+                //after the first call though.
+                if (requirejs._buildReset) {
+                    requirejs._buildReset();
+                    requirejs._cacheReset();
+                }
+
                 var result = build(config);
 
-                //Reset build internals on each run.
+                //And clean up, in case something else triggers
+                //a build in another pathway.
                 requirejs._buildReset();
+                requirejs._cacheReset();
 
                 if (callback) {
                     callback(result);
                 }
             };
-
-            //Enable execution of this callback in a build setting.
-            //Normally, once requirePatch is run, by default it will
-            //not execute callbacks, unless this property is set on
-            //the callback.
-            runBuild.__requireJsBuild = true;
 
             requirejs({
                 context: 'build'
@@ -204,9 +212,7 @@ var requirejs, require, define;
                 }
 
                 var req = requirejs({
-                    context: contextName,
-                    requireLoad: requirejsVars.nodeLoad,
-                    requireExecCb: requirejsVars.nodeRequireExecCb
+                    context: contextName
                 });
 
                 req(['build'], function () {

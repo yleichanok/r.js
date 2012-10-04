@@ -1,5 +1,4 @@
-define(["require", "exports", "module", "./parse-js", "./process"], function(require, exports, module) {
-
+define(["require", "exports", "module", "./parse-js", "./squeeze-more"], function(require, exports, module) {
 var jsp = require("./parse-js"),
     pro = require("./process"),
     slice = jsp.slice,
@@ -47,8 +46,13 @@ function ast_squeeze_more(ast) {
                         }
                 },
                 "call": function(expr, args) {
+                        if (expr[0] == "dot" && expr[1][0] == "string" && args.length == 1
+                            && (args[0][1] > 0 && expr[2] == "substring" || expr[2] == "substr")) {
+                                return [ "call", [ "dot", expr[1], "slice"], args];
+                        }
                         if (expr[0] == "dot" && expr[2] == "toString" && args.length == 0) {
                                 // foo.toString()  ==>  foo+""
+                                if (expr[1][0] == "string") return expr[1];
                                 return [ "binary", "+", expr[1], [ "string", "" ]];
                         }
                         if (expr[0] == "name") {
@@ -70,4 +74,7 @@ function ast_squeeze_more(ast) {
 
 exports.ast_squeeze_more = ast_squeeze_more;
 
+// Local variables:
+// js-indent-level: 8
+// End:
 });

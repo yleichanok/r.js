@@ -1,7 +1,8 @@
-/*jslint plusplus: false, strict: false */
+/*jslint */
 /*global load: false, doh: false, define:false */
 
 define(['parse', 'env!env/file'], function (parse, file) {
+    'use strict';
 
     doh.register("parseConfig",
         [
@@ -78,6 +79,7 @@ define(['parse', 'env!env/file'], function (parse, file) {
                     good7 = "(function (factory){\nif(typeof define === 'function' && define.amd){\ndefine(['dep'], factory);\n}else{\nfactory(this.dep);\n}\n}(function(dep){\n}));",
                     good8 = "(function (factory){\nif(typeof define === 'function' && define.amd){\ndefine('some/name', ['dep1', 'dep2'], factory);\n}else{\nfactory(this.dep);\n}\n}(function(dep){\n}));",
                     good9 = "define(function (require) {\n//Dependencies with no usable return value.\nrequire('plugin!some/value');\n});",
+                    good10 = "define('good10', function (require) {\n//If have dependencies, get them here\nvar newt = require('newt');\nreturn {\nname: 'spell',\nnewtName: newt.name,\ntailName: newt.tailName,\neyeName: newt.eyeName\n};});",
                     emptyAnon1 = "define(function(){ return 'foo'; });";
 
                 t.is('define("one",["two","three"]);', parse("good1", "good1", good1));
@@ -89,8 +91,10 @@ define(['parse', 'env!env/file'], function (parse, file) {
                 t.is('define("good7",["dep"]);', parse("good7", "good7", good7));
                 t.is('define("some/name",["dep1","dep2"]);', parse("good8", "good8", good8));
                 t.is('define("good9",["require","plugin!some/value"]);', parse("good9", "good9", good9));
+                t.is('define("good10",["require","newt"]);', parse("good10", "good10", good10));
                 t.is('define("foo",[]);', parse("nested1", "nested1", nested1));
                 t.is('define("one",["me"]);', parse("bad1", "bad1", bad1));
+
                 t.is(null, parse("bad2", "bad2", bad2));
                 t.is(null, parse("bad3", "bad3", bad3));
                 t.is(null, parse("bad4", "bad4", bad4));
@@ -104,6 +108,28 @@ define(['parse', 'env!env/file'], function (parse, file) {
         ]
     );
     doh.run();
+
+
+    doh.register('parseFindNestedDependencies',
+        [
+            function parseFindNestedDependencies(t) {
+                var good1 = '(function() {\n' +
+                        '  define([\'require\', \'a\', \'b\'], function(require, a, b) {\n' +
+                        '    return require([\'c\'], function(c) {\n' +
+                        '      c(a, b);\n' +
+                        '    });\n' +
+                        '  });\n' +
+                        '}).call(this);\n'
+
+                t.is('define("good1",["require","a","b","c"]);', parse("good1", "good1", good1, {
+                    findNestedDependencies: true
+                }));
+            }
+        ]
+    );
+    doh.run();
+
+
 
     doh.register('parseHasRequire',
         [
@@ -147,6 +173,7 @@ define(['parse', 'env!env/file'], function (parse, file) {
                 t.is(true, parse.usesAmdOrRequireJs("good3", good3).require);
                 t.is(true, parse.usesAmdOrRequireJs("good4", good4).requirejs);
                 t.is(true, parse.usesAmdOrRequireJs("good5", good5).requireConfig);
+
                 t.is(true, parse.usesAmdOrRequireJs("good6", good6).require);
                 t.is(true, parse.usesAmdOrRequireJs("good7", good7).requirejs);
                 t.is(false, !!parse.usesAmdOrRequireJs("bad1", bad1));
@@ -231,6 +258,30 @@ define(['parse', 'env!env/file'], function (parse, file) {
                 t.is(0, parse.findCjsDependencies("bad1", bad1).length);
                 t.is(0, parse.findCjsDependencies("bad2", bad2).length);
                 t.is(0, parse.findCjsDependencies("bad3", bad3).length);
+            }
+        ]
+    );
+    doh.run();
+
+    doh.register('parseLicenseComments',
+        [
+            function parseLicenseComments(t) {
+                var manyCommentsName = 'parse/comments/manyComments.js',
+                    multiLineName = 'parse/comments/multiLine.js',
+                    multiSingleLineName = 'parse/comments/multiSingleLine.js',
+                    expectedManyCommentsName = 'parse/comments/expected/manyComments.js',
+                    expectedMultiLineName = 'parse/comments/expected/multiLine.js',
+                    expectedMultiSingleLineName = 'parse/comments/expected/multiSingleLine.js';
+
+
+                t.is(file.readFile(expectedManyCommentsName).trim(),
+                     parse.getLicenseComments(manyCommentsName, file.readFile(manyCommentsName)).trim());
+
+                t.is(file.readFile(expectedMultiLineName).trim(),
+                     parse.getLicenseComments(multiLineName, file.readFile(multiLineName)).trim());
+
+                t.is(file.readFile(expectedMultiSingleLineName).trim(),
+                     parse.getLicenseComments(multiSingleLineName, file.readFile(multiSingleLineName)).trim());
             }
         ]
     );

@@ -4,34 +4,36 @@
  * see: http://github.com/jrburke/requirejs for details
  */
 
-/*jslint plusplus: true, nomen: true  */
+/*jslint plusplus: true, nomen: true, regexp: true  */
 /*global define, require */
 
 
 define([ 'lang', 'logger', 'env!env/file', 'parse', 'optimize', 'pragma',
-         'env!env/load', 'requirePatch'],
-function (lang,   logger,   file,          parse,    optimize,   pragma,
-          load,           requirePatch) {
+         'transform', 'env!env/load', 'requirePatch', 'env!env/quit',
+         'commonJs'], function (lang, logger, file,  parse, optimize, pragma,
+          transform,   load,           requirePatch,   quit,
+          commonJs) {
     'use strict';
 
     var build, buildBaseConfig,
         endsWithSemiColonRegExp = /;\s*$/;
 
     buildBaseConfig = {
-            appDir: "",
-            pragmas: {},
-            paths: {},
-            optimize: "uglify",
-            optimizeCss: "standard.keepLines",
-            inlineText: true,
-            isBuild: true,
-            optimizeAllPluginResources: false,
-            findNestedDependencies: false,
-            preserveLicenseComments: true,
-            //By default, all files/directories are copied, unless
-            //they match this regexp, by default just excludes .folders
-            dirExclusionRegExp: file.dirExclusionRegExp
-        };
+        appDir: "",
+        pragmas: {},
+        paths: {},
+        optimize: "uglify",
+        optimizeCss: "standard.keepLines",
+        inlineText: true,
+        isBuild: true,
+        optimizeAllPluginResources: false,
+        findNestedDependencies: false,
+        preserveLicenseComments: true,
+        //By default, all files/directories are copied, unless
+        //they match this regexp, by default just excludes .folders
+        dirExclusionRegExp: file.dirExclusionRegExp,
+        _buildPathToModuleIndex: {}
+    };
 
     /**
      * Some JS may not be valid if concatenated with other JS, in particular
@@ -46,33 +48,16 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
         }
     }
 
-    /**
-     * If the path looks like an URL, throw an error. This is to prevent
-     * people from using URLs with protocols in the build config, since
-     * the optimizer is not set up to do network access. However, be
-     * sure to allow absolute paths on Windows, like C:\directory.
-     */
-    function disallowUrls(path) {
-        if ((path.indexOf('://') !== -1 || path.indexOf('//') === 0) && path !== 'empty:') {
-            throw new Error('Path is not supported: ' + path +
-                            '\nOptimizer can only handle' +
-                            ' local paths. Download the locally if necessary' +
-                            ' and update the config to use a local path.\n' +
-                            'http://requirejs.org/docs/errors.html#pathnotsupported');
-        }
-    }
-
     function endsWithSlash(dirName) {
         if (dirName.charAt(dirName.length - 1) !== "/") {
             dirName += "/";
         }
-        disallowUrls(dirName);
         return dirName;
     }
 
     //Method used by plugin writeFile calls, defined up here to avoid
     //jslint warning about "making a function in a loop".
-    function makeWriteFile(anonDefRegExp, namespaceWithDot, layer) {
+    function makeWriteFile(namespace, layer) {
         function writeFile(name, contents) {
             logger.trace('Saving plugin-optimized file: ' + name);
             file.saveUtf8File(name, contents);
@@ -80,7 +65,7 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
 
         writeFile.asModule = function (moduleName, fileName, contents) {
             writeFile(fileName,
-                build.toTransport(anonDefRegExp, namespaceWithDot, moduleName, fileName, contents, layer));
+                build.toTransport(namespace, moduleName, fileName, contents, layer));
         };
 
         return writeFile;
@@ -103,42 +88,95 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
      * there is a problem completing the build.
      */
     build = function (args) {
-        var buildFile, cmdConfig;
+        var buildFile, cmdConfig, errorMsg, errorStack, stackMatch, errorTree,
+            i, j, errorMod,
+            stackRegExp = /( {4}at[^\n]+)\n/,
+            standardIndent = '  ';
 
-        if (!args || lang.isArray(args)) {
-            if (!args || args.length < 1) {
-                logger.error("build.js buildProfile.js\n" +
-                      "where buildProfile.js is the name of the build file (see example.build.js for hints on how to make a build file).");
-                return undefined;
+        try {
+            if (!args || lang.isArray(args)) {
+                if (!args || args.length < 1) {
+                    logger.error("build.js buildProfile.js\n" +
+                          "where buildProfile.js is the name of the build file (see example.build.js for hints on how to make a build file).");
+                    return undefined;
+                }
+
+                //Next args can include a build file path as well as other build args.
+                //build file path comes first. If it does not contain an = then it is
+                //a build file path. Otherwise, just all build args.
+                if (args[0].indexOf("=") === -1) {
+                    buildFile = args[0];
+                    args.splice(0, 1);
+                }
+
+                //Remaining args are options to the build
+                cmdConfig = build.convertArrayToObject(args);
+                cmdConfig.buildFile = buildFile;
+            } else {
+                cmdConfig = args;
             }
 
-            //Next args can include a build file path as well as other build args.
-            //build file path comes first. If it does not contain an = then it is
-            //a build file path. Otherwise, just all build args.
-            if (args[0].indexOf("=") === -1) {
-                buildFile = args[0];
-                args.splice(0, 1);
+            return build._run(cmdConfig);
+        } catch (e) {
+            errorMsg = e.toString();
+            errorTree = e.moduleTree;
+            stackMatch = stackRegExp.exec(errorMsg);
+
+            if (stackMatch) {
+                errorMsg += errorMsg.substring(0, stackMatch.index + stackMatch[0].length + 1);
             }
 
-            //Remaining args are options to the build
-            cmdConfig = build.convertArrayToObject(args);
-            cmdConfig.buildFile = buildFile;
-        } else {
-            cmdConfig = args;
+            //If a module tree that shows what module triggered the error,
+            //print it out.
+            if (errorTree && errorTree.length > 0) {
+                errorMsg += '\nIn module tree:\n';
+
+                for (i = errorTree.length - 1; i > -1; i--) {
+                    errorMod = errorTree[i];
+                    if (errorMod) {
+                        for (j = errorTree.length - i; j > -1; j--) {
+                            errorMsg += standardIndent;
+                        }
+                        errorMsg += errorMod + '\n';
+                    }
+                }
+
+                logger.error(errorMsg);
+            }
+
+            errorStack = e.stack;
+
+            if (typeof args === 'string' && args.indexOf('stacktrace=true') !== -1) {
+                errorMsg += '\n' + errorStack;
+            } else {
+                if (!stackMatch && errorStack) {
+                    //Just trim out the first "at" in the stack.
+                    stackMatch = stackRegExp.exec(errorStack);
+                    if (stackMatch) {
+                        errorMsg += '\n' + stackMatch[0] || '';
+                    }
+                }
+            }
+
+            if (logger.level > logger.ERROR) {
+                throw new Error(errorMsg);
+            } else {
+                logger.error(errorMsg);
+                quit(1);
+            }
         }
-
-        return build._run(cmdConfig);
     };
 
     build._run = function (cmdConfig) {
-        var buildFileContents = "",
-            pluginCollector = {},
-            buildPaths, fileName, fileNames,
+        var buildPaths, fileName, fileNames,
             prop, paths, i,
             baseConfig, config,
             modules, builtModule, srcPath, buildContext,
             destPath, moduleName, moduleMap, parentModuleMap, context,
-            resources, resource, pluginProcessed = {}, plugin;
+            resources, resource, plugin, fileContents,
+            pluginProcessed = {},
+            buildFileContents = "",
+            pluginCollector = {};
 
         //Can now run the patches to require.js to allow it to be used for
         //build generation. Do it here instead of at the top of the module
@@ -151,6 +189,12 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
 
         if (config.logLevel) {
             logger.logLevel(config.logLevel);
+        }
+
+        //Remove the previous build dir, in case it contains source transforms,
+        //like the ones done with onBuildRead and onBuildWrite.
+        if (config.dir && !config.keepBuildDir && file.exists(config.dir)) {
+            file.deleteFile(config.dir);
         }
 
         if (!config.out && !config.cssIn) {
@@ -167,36 +211,41 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
                 //the paths to use the dirBaseUrl
                 for (prop in paths) {
                     if (paths.hasOwnProperty(prop)) {
-                        buildPaths[prop] = paths[prop].replace(config.baseUrl, config.dirBaseUrl);
+                        buildPaths[prop] = paths[prop].replace(config.appDir, config.dir);
                     }
                 }
             } else {
                 //If no appDir, then make sure to copy the other paths to this directory.
                 for (prop in paths) {
                     if (paths.hasOwnProperty(prop)) {
-                        //Set up build path for each path prefix.
-                        buildPaths[prop] = paths[prop] === 'empty:' ? 'empty:' : prop.replace(/\./g, "/");
+                        //Set up build path for each path prefix, but only do so
+                        //if the path falls out of the current baseUrl
+                        if (paths[prop].indexOf(config.baseUrl) === 0) {
+                            buildPaths[prop] = paths[prop].replace(config.baseUrl, config.dirBaseUrl);
+                        } else {
+                            buildPaths[prop] = paths[prop] === 'empty:' ? 'empty:' : prop.replace(/\./g, "/");
 
-                        //Make sure source path is fully formed with baseUrl,
-                        //if it is a relative URL.
-                        srcPath = paths[prop];
-                        if (srcPath.indexOf('/') !== 0 && srcPath.indexOf(':') === -1) {
-                            srcPath = config.baseUrl + srcPath;
-                        }
+                            //Make sure source path is fully formed with baseUrl,
+                            //if it is a relative URL.
+                            srcPath = paths[prop];
+                            if (srcPath.indexOf('/') !== 0 && srcPath.indexOf(':') === -1) {
+                                srcPath = config.baseUrl + srcPath;
+                            }
 
-                        destPath = config.dirBaseUrl + buildPaths[prop];
+                            destPath = config.dirBaseUrl + buildPaths[prop];
 
-                        //Skip empty: paths
-                        if (srcPath !== 'empty:') {
-                            //If the srcPath is a directory, copy the whole directory.
-                            if (file.exists(srcPath) && file.isDirectory(srcPath)) {
-                                //Copy files to build area. Copy all files (the /\w/ regexp)
-                                file.copyDir(srcPath, destPath, /\w/, true);
-                            } else {
-                                //Try a .js extension
-                                srcPath += '.js';
-                                destPath += '.js';
-                                file.copyFile(srcPath, destPath);
+                            //Skip empty: paths
+                            if (srcPath !== 'empty:') {
+                                //If the srcPath is a directory, copy the whole directory.
+                                if (file.exists(srcPath) && file.isDirectory(srcPath)) {
+                                    //Copy files to build area. Copy all files (the /\w/ regexp)
+                                    file.copyDir(srcPath, destPath, /\w/, true);
+                                } else {
+                                    //Try a .js extension
+                                    srcPath += '.js';
+                                    destPath += '.js';
+                                    file.copyFile(srcPath, destPath);
+                                }
                             }
                         }
                     }
@@ -225,7 +274,7 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
                     //as indicated by a true "create" property on the module, and
                     //it is not a plugin-loaded resource, then throw an error.
                     if (!file.exists(module._sourcePath) && !module.create &&
-                        module.name.indexOf('!') === -1) {
+                            module.name.indexOf('!') === -1) {
                         throw new Error("ERROR: module path does not exist: " +
                                         module._sourcePath + " for module named: " + module.name +
                                         ". Path is relative to: " + file.absPath('.'));
@@ -238,7 +287,8 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
             //Just set up the _buildPath for the module layer.
             require(config);
             if (!config.cssIn) {
-                config.modules[0]._buildPath = config.out;
+                config.modules[0]._buildPath = typeof config.out === 'function' ?
+                                               'FUNCTION' : config.out;
             }
         } else if (!config.cssIn) {
             //Now set up the config for require to use the build area, and calculate the
@@ -271,8 +321,12 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
         }
 
         if (modules) {
-            //For each module layer, call require to calculate dependencies.
-            modules.forEach(function (module) {
+            modules.forEach(function (module, i) {
+                //Save off buildPath to module index in a hash for quicker
+                //lookup later.
+                config._buildPathToModuleIndex[module._buildPath] = i;
+
+                //Call require to calculate dependencies.
                 module.layer = build.traceDependencies(module, config);
             });
 
@@ -323,37 +377,101 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
                 //Save it to a temp file for now, in case there are other layers that
                 //contain optimized content that should not be included in later
                 //layer optimizations. See issue #56.
-                file.saveUtf8File(module._buildPath + '-temp', builtModule.text);
+                if (module._buildPath === 'FUNCTION') {
+                    module._buildText = builtModule.text;
+                } else {
+                    file.saveUtf8File(module._buildPath + '-temp', builtModule.text);
+                }
                 buildFileContents += builtModule.buildText;
             });
 
             //Now move the build layers to their final position.
             modules.forEach(function (module) {
                 var finalPath = module._buildPath;
-                if (file.exists(finalPath)) {
-                    file.deleteFile(finalPath);
+                if (finalPath !== 'FUNCTION') {
+                    if (file.exists(finalPath)) {
+                        file.deleteFile(finalPath);
+                    }
+                    file.renameFile(finalPath + '-temp', finalPath);
+
+                    //And finally, if removeCombined is specified, remove
+                    //any of the files that were used in this layer.
+                    //Be sure not to remove other build layers.
+                    if (config.removeCombined) {
+                        module.layer.buildFilePaths.forEach(function (path) {
+                            if (file.exists(path) && !modules.some(function (mod) {
+                                    return mod._buildPath === path;
+                                })) {
+                                file.deleteFile(path);
+                            }
+                        });
+                    }
                 }
-                file.renameFile(finalPath + '-temp', finalPath);
             });
+        }
+
+        //If removeCombined in play, remove any empty directories that
+        //may now exist because of its use
+        if (config.removeCombined && !config.out && config.dir) {
+            file.deleteEmptyDirs(config.dir);
         }
 
         //Do other optimizations.
         if (config.out && !config.cssIn) {
             //Just need to worry about one JS file.
             fileName = config.modules[0]._buildPath;
-            optimize.jsFile(fileName, fileName, config);
+            if (fileName === 'FUNCTION') {
+                config.modules[0]._buildText = optimize.js(fileName,
+                                                           config.modules[0]._buildText,
+                                                           config);
+            } else {
+                optimize.jsFile(fileName, null, fileName, config);
+            }
         } else if (!config.cssIn) {
             //Normal optimizations across modules.
 
             //JS optimizations.
             fileNames = file.getFilteredFileList(config.dir, /\.js$/, true);
-            for (i = 0; (fileName = fileNames[i]); i++) {
+            fileNames.forEach(function (fileName, i) {
+                var cfg, moduleIndex, override;
+
                 //Generate the module name from the config.dir root.
                 moduleName = fileName.replace(config.dir, '');
                 //Get rid of the extension
                 moduleName = moduleName.substring(0, moduleName.length - 3);
-                optimize.jsFile(fileName, fileName, config, moduleName, pluginCollector);
-            }
+
+                //Convert the file to transport format, but without a name
+                //inserted (by passing null for moduleName) since the files are
+                //standalone, one module per file.
+                fileContents = file.readFile(fileName);
+
+                //For builds, if wanting cjs translation, do it now, so that
+                //the individual modules can be loaded cross domain via
+                //plain script tags.
+                if (config.cjsTranslate) {
+                    fileContents = commonJs.convert(fileName, fileContents);
+                }
+
+                fileContents = build.toTransport(config.namespace,
+                                                 null,
+                                                 fileName,
+                                                 fileContents);
+
+                //If there is an override for a specific layer build module,
+                //and this file is that module, mix in the override for use
+                //by optimize.jsFile.
+                moduleIndex = config._buildPathToModuleIndex[fileName];
+                override = moduleIndex === 0 || moduleIndex > 0 ?
+                           config.modules[moduleIndex].override : null;
+                if (override) {
+                    cfg = {};
+                    lang.mixin(cfg, config, override, true);
+                } else {
+                    cfg = config;
+                }
+
+                optimize.jsFile(fileName, fileContents, fileName, cfg, pluginCollector);
+            });
 
             //Normalize all the plugin resources.
             context = require.s.contexts._;
@@ -362,7 +480,8 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
                 if (pluginCollector.hasOwnProperty(moduleName)) {
                     parentModuleMap = context.makeModuleMap(moduleName);
                     resources = pluginCollector[moduleName];
-                    for (i = 0; (resource = resources[i]); i++) {
+                    for (i = 0; i < resources.length; i++) {
+                        resource = resources[i];
                         moduleMap = context.makeModuleMap(resource, parentModuleMap);
                         if (!context.plugins[moduleMap.prefix]) {
                             //Set the value in context.plugins so it
@@ -386,7 +505,7 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
                         //Only bother with plugin resources that can be handled
                         //processed by the plugin, via support of the writeFile
                         //method.
-                        if (!pluginProcessed[moduleMap.fullName]) {
+                        if (!pluginProcessed[moduleMap.id]) {
                             //Only do the work if the plugin was really loaded.
                             //Using an internal access because the file may
                             //not really be loaded.
@@ -397,14 +516,13 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
                                     moduleMap.name,
                                     require,
                                     makeWriteFile(
-                                        config.anonDefRegExp,
-                                        config.namespaceWithDot
+                                        config.namespace
                                     ),
                                     context.config
                                 );
                             }
 
-                            pluginProcessed[moduleMap.fullName] = true;
+                            pluginProcessed[moduleMap.id] = true;
                         }
                     }
 
@@ -423,6 +541,10 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
             buildFileContents += optimize.cssFile(config.cssIn, config.out, config);
         }
 
+        if (typeof config.out === 'function') {
+            config.out(config.modules[0]._buildText);
+        }
+
         //Print out what was built into which layers.
         if (buildFileContents) {
             logger.info(buildFileContents);
@@ -438,12 +560,21 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
      * name = paths.foo and value = ../some/path, so it assumes the
      * name=value splitting has already happened.
      */
-    function stringDotToObj(result, prop, name, value) {
-        if (!result[prop]) {
-            result[prop] = {};
-        }
-        name = name.substring((prop + '.').length, name.length);
-        result[prop][name] = value;
+    function stringDotToObj(result, name, value) {
+        var parts = name.split('.'),
+            prop = parts[0];
+
+        parts.forEach(function (prop, i) {
+            if (i === parts.length - 1) {
+                result[prop] = value;
+            } else {
+                if (!result[prop]) {
+                    result[prop] = {};
+                }
+                result = result[prop];
+            }
+
+        });
     }
 
     //Used by convertArrayToObject to convert some things from prop.name=value
@@ -457,7 +588,8 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
         'hasOnSave.',
         'wrap.',
         'uglify.',
-        'closure.'
+        'closure.',
+        'map.'
     ];
 
     build.hasDotPropMatch = function (prop) {
@@ -479,7 +611,8 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
             needArray = {
                 "include": true,
                 "exclude": true,
-                "excludeShallow": true
+                "excludeShallow": true,
+                "insertRequire": true
             };
 
         for (i = 0; i < ary.length; i++) {
@@ -503,7 +636,7 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
             }
 
             if (build.hasDotPropMatch(prop)) {
-                stringDotToObj(result, prop.split('.')[0], prop, value);
+                stringDotToObj(result, prop, value);
             } else {
                 result[prop] = value;
             }
@@ -526,8 +659,9 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
     build.makeAbsObject = function (props, obj, absFilePath) {
         var i, prop;
         if (obj) {
-            for (i = 0; (prop = props[i]); i++) {
-                if (obj.hasOwnProperty(prop)) {
+            for (i = 0; i < props.length; i++) {
+                prop = props[i];
+                if (obj.hasOwnProperty(prop) && typeof obj[prop] === 'string') {
                     obj[prop] = build.makeAbsPath(obj[prop], absFilePath);
                 }
             }
@@ -542,7 +676,9 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
         var props, prop, i;
 
         props = ["appDir", "dir", "baseUrl"];
-        for (i = 0; (prop = props[i]); i++) {
+        for (i = 0; i < props.length; i++) {
+            prop = props[i];
+
             if (config[prop]) {
                 //Add abspath if necessary, make sure these paths end in
                 //slashes
@@ -563,16 +699,6 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
                 }
 
                 config[prop] = endsWithSlash(config[prop]);
-            }
-        }
-
-        //Do not allow URLs for paths resources.
-        if (config.paths) {
-            for (prop in config.paths) {
-                if (config.paths.hasOwnProperty(prop)) {
-                    config.paths[prop] = build.makeAbsPath(config.paths[prop],
-                                              (config.baseUrl || absFilePath));
-                }
             }
         }
 
@@ -601,13 +727,34 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
                 //allow a one-level-deep mixing of it.
                 value = source[prop];
                 if (typeof value === 'object' && value &&
-                    !lang.isArray(value) && !lang.isFunction(value) &&
-                    !lang.isRegExp(value)) {
+                        !lang.isArray(value) && !lang.isFunction(value) &&
+                        !lang.isRegExp(value)) {
                     target[prop] = lang.mixin({}, target[prop], value, true);
                 } else {
                     target[prop] = value;
                 }
             }
+        }
+    }
+
+    /**
+     * Converts a wrap.startFile or endFile to be start/end as a string.
+     * the startFile/endFile values can be arrays.
+     */
+    function flattenWrapFile(wrap, keyName, absFilePath) {
+        var keyFileName = keyName + 'File';
+
+        if (typeof wrap[keyName] !== 'string' && wrap[keyFileName]) {
+            wrap[keyName] = '';
+            if (typeof wrap[keyFileName] === 'string') {
+                wrap[keyFileName] = [wrap[keyFileName]];
+            }
+            wrap[keyFileName].forEach(function (fileName) {
+                wrap[keyName] += (wrap[keyName] ? '\n' : '') +
+                    file.readFile(build.makeAbsPath(fileName, absFilePath));
+            });
+        } else if (typeof wrap[keyName] !== 'string') {
+            throw new Error('wrap.' + keyName + ' or wrap.' + keyFileName + ' malformed');
         }
     }
 
@@ -625,7 +772,7 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
     build.createConfig = function (cfg) {
         /*jslint evil: true */
         var config = {}, buildFileContents, buildFileConfig, mainConfig,
-            mainConfigFile, prop, buildFile, absFilePath;
+            mainConfigFile, mainConfigPath, prop, buildFile, absFilePath;
 
         //Make sure all paths are relative to current directory.
         absFilePath = file.absPath('.');
@@ -653,10 +800,12 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
                 buildFileConfig = eval("(" + buildFileContents + ")");
                 build.makeAbsConfig(buildFileConfig, absFilePath);
 
-                if (!buildFileConfig.out && !buildFileConfig.dir) {
-                    buildFileConfig.dir = (buildFileConfig.baseUrl || config.baseUrl) + "/build/";
-                }
-
+                //Mix in the config now so that items in mainConfigFile can
+                //be resolved relative to them if necessary, like if appDir
+                //is set here, but the baseUrl is in mainConfigFile. Will
+                //re-mix in the same build config later after mainConfigFile
+                //is processed, since build config should take priority.
+                mixConfig(config, buildFileConfig);
             } catch (e) {
                 throw new Error("Build file " + buildFile + " is malformed: " + e);
             }
@@ -665,6 +814,9 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
         mainConfigFile = config.mainConfigFile || (buildFileConfig && buildFileConfig.mainConfigFile);
         if (mainConfigFile) {
             mainConfigFile = build.makeAbsPath(mainConfigFile, absFilePath);
+            if (!file.exists(mainConfigFile)) {
+                throw new Error(mainConfigFile + ' does not exist.');
+            }
             try {
                 mainConfig = parse.findConfig(mainConfigFile, file.readFile(mainConfigFile));
             } catch (configError) {
@@ -677,11 +829,21 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
                         ' into a build file or command line arguments given to the optimizer.');
             }
             if (mainConfig) {
+                mainConfigPath = mainConfigFile.substring(0, mainConfigFile.lastIndexOf('/'));
+
+                //Add in some existing config, like appDir, since they can be
+                //used inside the mainConfigFile -- paths and baseUrl are
+                //relative to them.
+                if (config.appDir && !mainConfig.appDir) {
+                    mainConfig.appDir = config.appDir;
+                }
+
                 //If no baseUrl, then use the directory holding the main config.
                 if (!mainConfig.baseUrl) {
-                    mainConfig.baseUrl = mainConfigFile.substring(0, mainConfigFile.lastIndexOf('/'));
+                    mainConfig.baseUrl = mainConfigPath;
                 }
-                build.makeAbsConfig(mainConfig, mainConfigFile);
+
+                build.makeAbsConfig(mainConfig, mainConfigPath);
                 mixConfig(config, mainConfig);
             }
         }
@@ -695,6 +857,16 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
         //args should take precedence over build file values.
         mixConfig(config, cfg);
 
+        //Fix paths to full paths so that they can be adjusted consistently
+        //lately to be in the output area.
+        lang.eachProp(config.paths, function (value, prop) {
+            if (lang.isArray(value)) {
+                throw new Error('paths fallback not supported in optimizer. ' +
+                                'Please provide a build config path override ' +
+                                'for ' + prop);
+            }
+            config.paths[prop] = build.makeAbsPath(value, config.baseUrl);
+        });
 
         //Set final output dir
         if (config.hasOwnProperty("baseUrl")) {
@@ -709,11 +881,20 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
         }
 
         //Check for errors in config
+        if (config.main) {
+            throw new Error('"main" passed as an option, but the ' +
+                            'supported option is called "name".');
+        }
+        if (!config.name && !config.modules && !config.include && !config.cssIn) {
+            throw new Error('Missing either a "name", "include" or "modules" ' +
+                            'option');
+        }
         if (config.cssIn && !config.out) {
             throw new Error("ERROR: 'out' option missing.");
         }
         if (!config.cssIn && !config.baseUrl) {
-            throw new Error("ERROR: 'baseUrl' option missing.");
+            //Just use the current directory as the baseUrl
+            config.baseUrl = './';
         }
         if (!config.out && !config.dir) {
             throw new Error('Missing either an "out" or "dir" config value. ' +
@@ -733,6 +914,11 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
                             ' or baseUrl directories optimized.');
         }
 
+        if (config.insertRequire && !lang.isArray(config.insertRequire)) {
+            throw new Error('insertRequire should be a list of module IDs' +
+                            ' to insert in to a require([]) call.');
+        }
+
         if ((config.name || config.include) && !config.modules) {
             //Just need to build one file, but may be part of a whole appDir/
             //baseUrl copy, but specified on the command line, so cannot do
@@ -742,11 +928,23 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
                 {
                     name: config.name,
                     out: config.out,
+                    create: config.create,
                     include: config.include,
                     exclude: config.exclude,
-                    excludeShallow: config.excludeShallow
+                    excludeShallow: config.excludeShallow,
+                    insertRequire: config.insertRequire
                 }
             ];
+        } else if (config.modules && config.out) {
+            throw new Error('If the "modules" option is used, then there ' +
+                            'should be a "dir" option set and "out" should ' +
+                            'not be used since "out" is only for single file ' +
+                            'optimization output.');
+        } else if (config.modules && config.name) {
+            throw new Error('"name" and "modules" options are incompatible. ' +
+                            'Either use "name" if doing a single file ' +
+                            'optimization, or "modules" if you want to target ' +
+                            'more than one file for optimization.');
         }
 
         if (config.out && !config.cssIn) {
@@ -761,13 +959,13 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
             }
         }
 
-        //Do not allow URLs for paths resources.
-        if (config.paths) {
-            for (prop in config.paths) {
-                if (config.paths.hasOwnProperty(prop)) {
-                    disallowUrls(config.paths[prop]);
-                }
-            }
+        //Create a hash lookup for the stubModules config to make lookup
+        //cheaper later.
+        if (config.stubModules) {
+            config.stubModules._byName = {};
+            config.stubModules.forEach(function (id) {
+                config.stubModules._byName[id] = true;
+            });
         }
 
         //Get any wrap text.
@@ -780,22 +978,14 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
                         end: '}());'
                     };
                 } else {
-                    config.wrap.start = config.wrap.start ||
-                            file.readFile(build.makeAbsPath(config.wrap.startFile, absFilePath));
-                    config.wrap.end = config.wrap.end ||
-                            file.readFile(build.makeAbsPath(config.wrap.endFile, absFilePath));
+                    flattenWrapFile(config.wrap, 'start', absFilePath);
+                    flattenWrapFile(config.wrap, 'end', absFilePath);
                 }
             }
         } catch (wrapError) {
             throw new Error('Malformed wrap config: need both start/end or ' +
                             'startFile/endFile: ' + wrapError.toString());
         }
-
-
-        //Set up proper info for namespaces and using namespaces in transport
-        //wrappings.
-        config.namespaceWithDot = config.namespace ? config.namespace + '.' : '';
-        config.anonDefRegExp = build.makeAnonDefRegExp(config.namespaceWithDot);
 
         //Do final input verification
         if (config.context) {
@@ -805,18 +995,23 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
         }
 
         //Set file.fileExclusionRegExp if desired
-        if ('fileExclusionRegExp' in config) {
+        if (config.hasOwnProperty('fileExclusionRegExp')) {
             if (typeof config.fileExclusionRegExp === "string") {
                 file.exclusionRegExp = new RegExp(config.fileExclusionRegExp);
             } else {
                 file.exclusionRegExp = config.fileExclusionRegExp;
             }
-        } else if ('dirExclusionRegExp' in config) {
+        } else if (config.hasOwnProperty('dirExclusionRegExp')) {
             //Set file.dirExclusionRegExp if desired, this is the old
             //name for fileExclusionRegExp before 1.0.2. Support for backwards
             //compatibility
             file.exclusionRegExp = config.dirExclusionRegExp;
         }
+
+        //Remove things that may cause problems in the build.
+        delete config.jQuery;
+        delete config.enforceDefine;
+        delete config.urlArgs;
 
         return config;
     };
@@ -830,7 +1025,8 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
      */
     build.findBuildModule = function (moduleName, modules) {
         var i, module;
-        for (i = 0; (module = modules[i]); i++) {
+        for (i = 0; i < modules.length; i++) {
+            module = modules[i];
             if (module.name === moduleName) {
                 return module;
             }
@@ -850,10 +1046,6 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
         if (index !== -1) {
             layer.buildFilePaths.splice(index, 1);
         }
-
-        //Take it out of the specified modules. Specified modules are mostly
-        //used to find require modifiers.
-        delete layer.specified[module];
     };
 
     /**
@@ -867,7 +1059,16 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
      * be in the flattened module.
      */
     build.traceDependencies = function (module, config) {
-        var include, override, layer, context, baseConfig, oldContext;
+        var include, override, layer, context, baseConfig, oldContext,
+            registry, id, idParts, pluginId,
+            errMessage = '',
+            failedPluginMap = {},
+            failedPluginIds = [],
+            errIds = [],
+            errUrlMap = {},
+            errUrlConflicts = {},
+            hasErrUrl = false,
+            errUrl, prop;
 
         //Reset some state set up in requirePatch.js, and clean up require's
         //current context.
@@ -883,7 +1084,7 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
         //WARNING: probably not robust for paths and packages/packagePaths,
         //since those property's objects can be modified. But for basic
         //config clone it works out.
-        require(lang.delegate(baseConfig));
+        require(lang.mixin({}, baseConfig, true));
 
         logger.trace("\nTracing dependencies for: " + (module.name || module.out));
         include = module.name && !module.create ? [module.name] : [];
@@ -893,7 +1094,7 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
 
         //If there are overrides to basic config, set that up now.;
         if (module.override) {
-            override = lang.delegate(baseConfig);
+            override = lang.mixin({}, baseConfig, true);
             lang.mixin(override, module.override, true);
             require(override);
         }
@@ -901,12 +1102,67 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
         //Figure out module layer dependencies by calling require to do the work.
         require(include);
 
-        //Pull out the layer dependencies.
-        layer.specified = context.specified;
-
         //Reset config
         if (module.override) {
             require(baseConfig);
+        }
+
+        //Check to see if it all loaded. If not, then stop, and give
+        //a message on what is left.
+        registry = context.registry;
+        for (id in registry) {
+            if (registry.hasOwnProperty(id) && id.indexOf('_@r') !== 0) {
+                if (id.indexOf('_unnormalized') === -1 && registry[id].enabled) {
+                    errIds.push(id);
+                    errUrl = registry[id].map.url;
+
+                    if (errUrlMap[errUrl]) {
+                        hasErrUrl = true;
+                        //This error module has the same URL as another
+                        //error module, could be misconfiguration.
+                        if (!errUrlConflicts[errUrl]) {
+                            errUrlConflicts[errUrl] = [];
+                            //Store the original module that had the same URL.
+                            errUrlConflicts[errUrl].push(errUrlMap[errUrl]);
+                        }
+                        errUrlConflicts[errUrl].push(id);
+                    } else {
+                        errUrlMap[errUrl] = id;
+                    }
+                }
+
+                //Look for plugins that did not call load()
+                idParts = id.split('!');
+                pluginId = idParts[0];
+                if (idParts.length > 1 && !failedPluginMap.hasOwnProperty(pluginId)) {
+                    failedPluginIds.push(pluginId);
+                    failedPluginMap[pluginId] = true;
+                }
+            }
+        }
+
+        if (errIds.length || failedPluginIds.length) {
+            if (failedPluginIds.length) {
+                errMessage += 'Loader plugin' +
+                    (failedPluginIds.length === 1 ? '' : 's') +
+                    ' did not call ' +
+                    'the load callback in the build: ' +
+                    failedPluginIds.join(', ') + '\n';
+            }
+            errMessage += 'Module loading did not complete for: ' + errIds.join(', ');
+
+            if (hasErrUrl) {
+                errMessage += '\nThe following modules share the same URL. This ' +
+                              'could be a misconfiguration if that URL only has ' +
+                              'one anonymous module in it:';
+                for (prop in errUrlConflicts) {
+                    if (errUrlConflicts.hasOwnProperty(prop)) {
+                        errMessage += '\n' + prop + ': ' +
+                                      errUrlConflicts[prop].join(', ');
+                    }
+                }
+            }
+            throw new Error(errMessage);
         }
 
         return layer;
@@ -927,19 +1183,24 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
      * included in the flattened module text.
      */
     build.flattenModule = function (module, layer, config) {
-        var buildFileContents = "",
-            namespace = config.namespace ? config.namespace + '.' : '',
-            context = layer.context,
-            anonDefRegExp = config.anonDefRegExp,
-            path, reqIndex, fileContents, currContents,
-            i, moduleName,
-            parts, builder, writeApi;
 
         //Use override settings, particularly for pragmas
+        //Do this before the var readings since it reads config values.
         if (module.override) {
-            config = lang.delegate(config);
+            config = lang.mixin({}, config, true);
             lang.mixin(config, module.override, true);
         }
+
+        var path, reqIndex, fileContents, currContents,
+            i, moduleName, shim, packageConfig,
+            parts, builder, writeApi,
+            context = layer.context,
+            buildFileContents = "",
+            namespace = config.namespace || '',
+            namespaceWithDot = namespace ? namespace + '.' : '',
+            stubModulesByName = (config.stubModules && config.stubModules._byName) || {},
+            onLayerEnds = [],
+            onLayerEndAdded = {};
 
         //Start build output for the module.
         buildFileContents += "\n" +
@@ -957,14 +1218,28 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
 
         //Write the built module to disk, and build up the build output.
         fileContents = "";
-        for (i = 0; (path = layer.buildFilePaths[i]); i++) {
+        for (i = 0; i < layer.buildFilePaths.length; i++) {
+            path = layer.buildFilePaths[i];
             moduleName = layer.buildFileToModule[path];
+
+            //If the moduleName is for a package main, then update it to the
+            //real main value.
+            packageConfig = layer.context.config.pkgs &&
+                            layer.context.config.pkgs[moduleName];
+            if (packageConfig) {
+                moduleName += '/' + packageConfig.main;
+            }
 
             //Figure out if the module is a result of a build plugin, and if so,
             //then delegate to that plugin.
             parts = context.makeModuleMap(moduleName);
             builder = parts.prefix && context.defined[parts.prefix];
             if (builder) {
+                if (builder.onLayerEnd && !onLayerEndAdded[parts.prefix]) {
+                    onLayerEnds.push(builder);
+                    onLayerEndAdded[parts.prefix] = true;
+                }
+
                 if (builder.write) {
                     writeApi = function (input) {
                         fileContents += "\n" + addSemiColon(input);
@@ -974,8 +1249,9 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
                     };
                     writeApi.asModule = function (moduleName, input) {
                         fileContents += "\n" +
-                                        addSemiColon(
-                                            build.toTransport(anonDefRegExp, namespace, moduleName, path, input, layer));
+                            addSemiColon(build.toTransport(namespace, moduleName, path, input, layer, {
+                                useSourceUrl: layer.context.config.useSourceUrl
+                            }));
                         if (config.onBuildWrite) {
                             fileContents = config.onBuildWrite(moduleName, path, fileContents);
                         }
@@ -983,17 +1259,43 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
                     builder.write(parts.prefix, parts.name, writeApi);
                 }
             } else {
-                currContents = file.readFile(path);
+                if (stubModulesByName.hasOwnProperty(moduleName)) {
+                    //Just want to insert a simple module definition instead
+                    //of the source module. Useful for plugins that inline
+                    //all their resources.
+                    if (layer.context.plugins.hasOwnProperty(moduleName)) {
+                        //Slightly different content for plugins, to indicate
+                        //that dynamic loading will not work.
+                        currContents = 'define({load: function(id){throw new Error("Dynamic load not allowed: " + id);}});';
+                    } else {
+                        currContents = 'define({});';
+                    }
+                } else {
+                    currContents = file.readFile(path);
+                }
+
+                if (config.cjsTranslate) {
+                    currContents = commonJs.convert(path, currContents);
+                }
 
                 if (config.onBuildRead) {
                     currContents = config.onBuildRead(moduleName, path, currContents);
                 }
 
-                if (config.namespace) {
-                    currContents = pragma.namespace(currContents, config.namespace);
+                if (namespace) {
+                    currContents = pragma.namespace(currContents, namespace);
                 }
 
-                currContents = build.toTransport(anonDefRegExp, namespace, moduleName, path, currContents, layer);
+                currContents = build.toTransport(namespace, moduleName, path, currContents, layer, {
+                    useSourceUrl: config.useSourceUrl
+                });
+
+                if (packageConfig) {
+                    currContents = addSemiColon(currContents) + '\n';
+                    currContents += namespaceWithDot + "define('" +
+                                    packageConfig.name + "', ['" + moduleName +
+                                    "'], function (main) { return main; });\n";
+                }
 
                 if (config.onBuildWrite) {
                     currContents = config.onBuildWrite(moduleName, path, currContents);
@@ -1010,20 +1312,41 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
             //after the module is processed.
             //If we have a name, but no defined module, then add in the placeholder.
             if (moduleName && !layer.modulesWithNames[moduleName] && !config.skipModuleInsertion) {
-                //If including jquery, register the module correctly, otherwise
-                //register an empty function. For jquery, make sure jQuery is
-                //a real object, and perhaps not some other file mapping, like
-                //to zepto.
-                if (moduleName === 'jquery') {
-                    fileContents += '\n(function () {\n' +
-                                   'var jq = typeof jQuery !== "undefined" && jQuery;\n' +
-                                   namespace +
-                                   'define("jquery", [], function () { return jq; });\n' +
-                                   '}());\n';
+                shim = config.shim && config.shim[moduleName];
+                if (shim) {
+                    fileContents += '\n' + namespaceWithDot + 'define("' + moduleName + '", ' +
+                                     (shim.deps && shim.deps.length ?
+                                            build.makeJsArrayString(shim.deps) + ', ' : '') +
+                                     (shim.exportsFn ? shim.exportsFn() : 'function(){}') +
+                                     ');\n';
                 } else {
-                    fileContents += '\n' + namespace + 'define("' + moduleName + '", function(){});\n';
+                    fileContents += '\n' + namespaceWithDot + 'define("' + moduleName + '", function(){});\n';
                 }
             }
+        }
+
+        if (onLayerEnds.length) {
+            onLayerEnds.forEach(function (builder) {
+                var path;
+                if (typeof module.out === 'string') {
+                    path = module.out;
+                } else if (typeof module._buildPath === 'string') {
+                    path = module._buildPath;
+                }
+                builder.onLayerEnd(function (input) {
+                    fileContents += "\n" + addSemiColon(input);
+                }, {
+                    name: module.name,
+                    path: path
+                });
+            });
+        }
+
+        //Add a require at the end to kick start module execution, if that
+        //was desired. Usually this is only specified when using small shim
+        //loaders like almond.
+        if (module.insertRequire) {
+            fileContents += '\n' + namespaceWithDot + 'require(["' + module.insertRequire.join('", "') + '"]);\n';
         }
 
         return {
@@ -1034,64 +1357,33 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
         };
     };
 
-    /**
-     * Creates the regexp to find anonymous defines.
-     * @param {String} namespace an optional namespace to use. The namespace
-     * should *include* a trailing dot. So a valid value would be 'foo.'
-     * @returns {RegExp}
-     */
-    build.makeAnonDefRegExp = function (namespace) {
-        //This regexp is not bullet-proof, and it has one optional part to
-        //avoid issues with some Dojo transition modules that use a
-        //define(\n//begin v1.x content
-        //for a comment.
-        return new RegExp('(^|[^\\.])(' + (namespace || '').replace(/\./g, '\\.') +
-                          'define|define)\\s*\\(\\s*(\\/\\/[^\\n\\r]*[\\r\\n])?(\\[|function|[\\w\\d_\\-\\$]+\\s*\\)|\\{|["\']([^"\']+)["\'])(\\s*,\\s*f)?');
+    //Converts an JS array of strings to a string representation.
+    //Not using JSON.stringify() for Rhino's sake.
+    build.makeJsArrayString = function (ary) {
+        return '["' + ary.map(function (item) {
+            //Escape any double quotes, backslashes
+            return lang.jsEscape(item);
+        }).join('","') + '"]';
     };
 
-    build.leadingCommaRegExp = /^\s*,/;
+    build.toTransport = function (namespace, moduleName, path, contents, layer, options) {
+        var baseUrl = layer && layer.context.config.baseUrl;
 
-    build.toTransport = function (anonDefRegExp, namespace, moduleName, path, contents, layer) {
-
-        //If anonymous module, insert the module name.
-        return contents.replace(anonDefRegExp, function (match, start, callName, possibleComment, suffix, namedModule, namedFuncStart) {
-            //A named module with either listed dependencies or an object
-            //literal for a value. Skip it. If named module, only want ones
-            //whose next argument is a function literal to scan for
-            //require('') dependecies.
-            if (namedModule && !namedFuncStart) {
-                return match;
-            }
-
+        function onFound(info) {
             //Only mark this module as having a name if not a named module,
             //or if a named module and the name matches expectations.
-            if (layer && (!namedModule || namedModule === moduleName)) {
+            if (layer && (info.needsId || info.foundId === moduleName)) {
                 layer.modulesWithNames[moduleName] = true;
             }
+        }
 
-            var deps = null;
+        //Convert path to be a local one to the baseUrl, useful for
+        //useSourceUrl.
+        if (baseUrl) {
+            path = path.replace(baseUrl, '');
+        }
 
-            //Look for CommonJS require calls inside the function if this is
-            //an anonymous define call that just has a function registered.
-            //Also look if a named define function but has a factory function
-            //as the second arg that should be scanned for dependencies.
-            if (suffix.indexOf('f') !== -1 || (namedModule)) {
-                deps = parse.getAnonDeps(path, contents);
-
-                if (deps.length) {
-                    deps = deps.map(function (dep) {
-                        return "'" + dep + "'";
-                    });
-                } else {
-                    deps = [];
-                }
-            }
-
-            return start + namespace + "define('" + (namedModule || moduleName) + "'," +
-                   (deps ? ('[' + deps.toString() + '],') : '') +
-                   (namedModule ? namedFuncStart.replace(build.leadingCommaRegExp, '') : suffix);
-        });
-
+        return transform.toTransport(namespace, moduleName, path, contents, onFound, options);
     };
 
     return build;

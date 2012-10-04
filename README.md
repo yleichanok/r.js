@@ -4,7 +4,7 @@ A command line tool for running JavaScript scripts that use the
 [Asychronous Module Defintion API (AMD)](http://wiki.commonjs.org/wiki/Modules/AsynchronousDefinition)
 for declaring and using JavaScript modules and regular JavaScript script files.
 
-It is part of the [RequireJS project](http://requirejs.org), and works will with
+It is part of the [RequireJS project](http://requirejs.org), and works with
 the RequireJS implementation of AMD.
 
 r.js is a single script that has two major functions:
@@ -118,9 +118,26 @@ modules.
 
 # Directory layout
 
-**NOTE**: If you clone this repository, it **must** be a sibling to a clone of the
-[RequireJS repository](https://github.com/jrburke/requirejs), where that
-repository is called **requirejs**. Otherwise the tests will not run.
+## Directory prerequisites
+
+r.js assumes that there are some other projects checked out as sibling
+directories to it, and named certain names, in order for the tests to pass.
+
+So it is best to create the following directory structure with the following
+git clone commands:
+
+    mkdir requirejs
+    cd requirejs
+    git clone git://github.com/jrburke/r.js.git
+    git clone git://github.com/jrburke/requirejs.git
+    git clone git://github.com/requirejs/text.git
+
+So there should be a sibling `requirejs` and `text` directories to the r.js
+directory containing your clone of the r.js project.
+
+## Directory details
+
+The r.js project has the following directory layout:
 
 * **dist.js**: the script that builds r.js
 * **require.js**: the version of require.js to include in r.js
@@ -154,6 +171,13 @@ page for info on how to contribute code/bug fixes to this project.
 Use GitHub pull requests to point to code changes, although for larger changes,
 contact the [requirejs mailing list](http://groups.google.com/group/requirejs)
 to discuss them first.
+
+# Included libraries
+
+r.js includes modules from these projects:
+
+* [Esprima](http://esprima.org/)
+* [UglifyJS](https://github.com/mishoo/UglifyJS)
 
 # Doing a release
 

@@ -1,5 +1,4 @@
 define(["require", "exports", "module", "./parse-js", "./squeeze-more"], function(require, exports, module) {
-
 /***********************************************************************
 
   A JavaScript tokenizer / parser / beautifier / compressor.
@@ -61,8 +60,10 @@ define(["require", "exports", "module", "./parse-js", "./squeeze-more"], functio
  ***********************************************************************/
 
 var jsp = require("./parse-js"),
+    curry = jsp.curry,
     slice = jsp.slice,
     member = jsp.member,
+    is_identifier_char = jsp.is_identifier_char,
     PRECEDENCE = jsp.PRECEDENCE,
     OPERATORS = jsp.OPERATORS;
 
@@ -141,6 +142,9 @@ function ast_walker() {
                 "function": function(name, args, body) {
                         return [ this[0], name, args.slice(), MAP(body, walk) ];
                 },
+                "debugger": function() {
+                        return [ this[0] ];
+                },
                 "defun": function(name, args, body) {
                         return [ this[0], name, args.slice(), MAP(body, walk) ];
                 },
@@ -201,6 +205,9 @@ function ast_walker() {
                 },
                 "atom": function(name) {
                         return [ this[0], name ];
+                },
+                "directive": function(dir) {
+                        return [ this[0], dir ];
                 }
         };
 
@@ -273,6 +280,7 @@ function Scope(parent) {
         this.refs = {};         // names referenced from this scope
         this.uses_with = false; // will become TRUE if with() is detected in this or any subscopes
         this.uses_eval = false; // will become TRUE if eval() is detected in this or any subscopes
+        this.directives = [];   // directives activated from this scope
         this.parent = parent;   // parent scope
         this.children = [];     // sub-scopes
         if (parent) {
@@ -283,13 +291,21 @@ function Scope(parent) {
         }
 };
 
+function base54_digits() {
+        if (typeof DIGITS_OVERRIDE_FOR_TESTING != "undefined")
+                return DIGITS_OVERRIDE_FOR_TESTING;
+        else
+                return "etnrisouaflchpdvmgybwESxTNCkLAOM_DPHBjFIqRUzWXV$JKQGYZ0516372984";
+}
+
 var base54 = (function(){
-        var DIGITS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ$_";
+        var DIGITS = base54_digits();
         return function(num) {
-                var ret = "";
+                var ret = "", base = 54;
                 do {
-                        ret = DIGITS.charAt(num % 54) + ret;
-                        num = Math.floor(num / 54);
+                        ret += DIGITS.charAt(num % base);
+                        num = Math.floor(num / base);
+                        base = 64;
                 } while (num > 0);
                 return ret;
         };
@@ -374,6 +390,9 @@ Scope.prototype = {
                                 this.names[name] = type || "var";
                         return name;
                 }
+        },
+        active_directive: function(dir) {
+                return member(dir, this.directives) || this.parent && this.parent.active_directive(dir);
         }
 };
 
@@ -493,11 +512,21 @@ function ast_add_scope(ast) {
 
 function ast_mangle(ast, options) {
         var w = ast_walker(), walk = w.walk, scope;
-        options = options || {};
+        options = defaults(options, {
+                mangle       : true,
+                toplevel     : false,
+                defines      : null,
+                except       : null,
+                no_functions : false
+        });
 
         function get_mangled(name, newMangle) {
+                if (!options.mangle) return name;
                 if (!options.toplevel && !scope.parent) return name; // don't mangle toplevel
                 if (options.except && member(name, options.except))
+                        return name;
+                if (options.no_functions && HOP(scope.names, name) &&
+                    (scope.names[name] == 'defun' || scope.names[name] == 'lambda'))
                         return name;
                 return scope.get_mangled(name, newMangle);
         };
@@ -516,7 +545,7 @@ function ast_mangle(ast, options) {
         };
 
         function _lambda(name, args, body) {
-                if (!options.no_functions) {
+                if (!options.no_functions && options.mangle) {
                         var is_defun = this[0] == "defun", extra;
                         if (name) {
                                 if (is_defun) name = get_mangled(name);
@@ -602,6 +631,9 @@ function ast_mangle(ast, options) {
                         return with_scope(self.scope, function(){
                                 return [ self[0], MAP(body, walk) ];
                         });
+                },
+                "directive": function() {
+                        return MAP.at_top(this);
                 }
         }, function() {
                 return walk(ast_add_scope(ast));
@@ -743,7 +775,9 @@ var when_constant = (function(){
                             case "string": ast =  [ "string", val ]; break;
                             case "number": ast =  [ "num", val ]; break;
                             case "boolean": ast =  [ "name", String(val) ]; break;
-                            default: throw new Error("Can't handle constant of type: " + (typeof val));
+                            default:
+                                if (val === null) { ast = [ "atom", "null" ]; break; }
+                                throw new Error("Can't handle constant of type: " + (typeof val));
                         }
                         return yes.call(expr, ast, val);
                 } catch(ex) {
@@ -805,24 +839,22 @@ function prepare_ifs(ast) {
                         var fi = statements[i];
                         if (fi[0] != "if") continue;
 
-                        if (fi[3] && walk(fi[3])) continue;
+                        if (fi[3]) continue;
 
-                        var t = walk(fi[2]);
+                        var t = fi[2];
                         if (!aborts(t)) continue;
 
                         var conditional = walk(fi[1]);
 
-                        var e_body = statements.slice(i + 1);
+                        var e_body = redo_if(statements.slice(i + 1));
                         var e = e_body.length == 1 ? e_body[0] : [ "block", e_body ];
 
-                        var ret = statements.slice(0, i).concat([ [
+                        return statements.slice(0, i).concat([ [
                                 fi[0],          // "if"
                                 conditional,    // conditional
                                 t,              // then
                                 e               // else
                         ] ]);
-
-                        return redo_if(ret);
                 }
 
                 return statements;
@@ -868,6 +900,10 @@ function for_side_effects(ast, handler) {
                 if (op == "++" || op == "--")
                         return found.apply(this, arguments);
         };
+        function binary(op) {
+                if (op == "&&" || op == "||")
+                        return found.apply(this, arguments);
+        };
         return w.with_walkers({
                 "try": found,
                 "throw": found,
@@ -886,6 +922,8 @@ function for_side_effects(ast, handler) {
                 "return": found,
                 "unary-prefix": unary,
                 "unary-postfix": unary,
+                "conditional": found,
+                "binary": binary,
                 "defun": found
         }, function(){
                 while (true) try {
@@ -961,7 +999,7 @@ function ast_lift_variables(ast) {
                         if (ret == null) ret = d;
                         else ret = [ "seq", d, ret ];
                 }
-                if (ret == null) {
+                if (ret == null && w.parent()[0] != "for") {
                         if (w.parent()[0] == "for-in")
                                 return [ "name", defs[0][0] ];
                         return MAP.skip;
@@ -992,14 +1030,21 @@ function ast_lift_variables(ast) {
 };
 
 function ast_squeeze(ast, options) {
+        ast = squeeze_1(ast, options);
+        ast = squeeze_2(ast, options);
+        return ast;
+};
+
+function squeeze_1(ast, options) {
         options = defaults(options, {
                 make_seqs   : true,
                 dead_code   : true,
                 no_warnings : false,
-                keep_comps  : true
+                keep_comps  : true,
+                unsafe      : false
         });
 
-        var w = ast_walker(), walk = w.walk;
+        var w = ast_walker(), walk = w.walk, scope;
 
         function negate(c) {
                 var not_c = [ "unary-prefix", "!", c ];
@@ -1187,10 +1232,23 @@ function ast_squeeze(ast, options) {
                 });
         };
 
+        function abort_else(c, t, e) {
+                var ret = [ [ "if", negate(c), e ] ];
+                if (t[0] == "block") {
+                        if (t[1]) ret = ret.concat(t[1]);
+                } else {
+                        ret.push(t);
+                }
+                return walk([ "block", ret ]);
+        };
+
         function make_real_if(c, t, e) {
                 c = walk(c);
                 t = walk(t);
                 e = walk(e);
+
+                if (empty(e) && empty(t))
+                        return [ "stat", c ];
 
                 if (empty(t)) {
                         c = negate(c);
@@ -1212,17 +1270,16 @@ function ast_squeeze(ast, options) {
                                 }
                         })();
                 }
-                if (empty(e) && empty(t))
-                        return [ "stat", c ];
                 var ret = [ "if", c, t, e ];
                 if (t[0] == "if" && empty(t[3]) && empty(e)) {
                         ret = best_of(ret, walk([ "if", [ "binary", "&&", c, t[1] ], t[2] ]));
                 }
                 else if (t[0] == "stat") {
                         if (e) {
-                                if (e[0] == "stat") {
+                                if (e[0] == "stat")
                                         ret = best_of(ret, [ "stat", make_conditional(c, t[1], e[1]) ]);
-                                }
+                                else if (aborts(e))
+                                        ret = abort_else(c, t, e);
                         }
                         else {
                                 ret = best_of(ret, [ "stat", make_conditional(c, t[1]) ]);
@@ -1242,13 +1299,7 @@ function ast_squeeze(ast, options) {
                         ret = walk([ "block", ret ]);
                 }
                 else if (t && aborts(e)) {
-                        ret = [ [ "if", negate(c), e ] ];
-                        if (t[0] == "block") {
-                                if (t[1]) ret = ret.concat(t[1]);
-                        } else {
-                                ret.push(t);
-                        }
-                        ret = walk([ "block", ret ]);
+                        ret = abort_else(c, t, e);
                 }
                 return ret;
         };
@@ -1347,13 +1398,53 @@ function ast_squeeze(ast, options) {
                                 return [ this[0], rvalue[1], lvalue, rvalue[3] ]
                         }
                         return [ this[0], op, lvalue, rvalue ];
+                },
+                "call": function(expr, args) {
+                        expr = walk(expr);
+                        if (options.unsafe && expr[0] == "dot" && expr[1][0] == "string" && expr[2] == "toString") {
+                                return expr[1];
+                        }
+                        return [ this[0], expr,  MAP(args, walk) ];
+                },
+                "num": function (num) {
+                        if (!isFinite(num))
+                                return [ "binary", "/", num === 1 / 0
+                                         ? [ "num", 1 ] : num === -1 / 0
+                                         ? [ "unary-prefix", "-", [ "num", 1 ] ]
+                                         : [ "num", 0 ], [ "num", 0 ] ];
+
+                        return [ this[0], num ];
                 }
         }, function() {
-                for (var i = 0; i < 2; ++i) {
-                        ast = prepare_ifs(ast);
-                        ast = walk(ast);
-                }
-                return ast;
+                return walk(prepare_ifs(walk(prepare_ifs(ast))));
+        });
+};
+
+function squeeze_2(ast, options) {
+        var w = ast_walker(), walk = w.walk, scope;
+        function with_scope(s, cont) {
+                var save = scope, ret;
+                scope = s;
+                ret = cont();
+                scope = save;
+                return ret;
+        };
+        function lambda(name, args, body) {
+                return [ this[0], name, args, with_scope(body.scope, curry(MAP, body, walk)) ];
+        };
+        return w.with_walkers({
+                "directive": function(dir) {
+                        if (scope.active_directive(dir))
+                                return [ "block" ];
+                        scope.directives.push(dir);
+                },
+                "toplevel": function(body) {
+                        return [ this[0], with_scope(this.scope, curry(MAP, body, walk)) ];
+                },
+                "function": lambda,
+                "defun": lambda
+        }, function(){
+                return walk(ast_add_scope(ast));
         });
 };
 
@@ -1380,7 +1471,6 @@ function make_string(str, ascii_only) {
                     case "\f": return "\\f";
                     case "\n": return "\\n";
                     case "\r": return "\\r";
-                    case "\t": return "\\t";
                     case "\u2028": return "\\u2028";
                     case "\u2029": return "\\u2029";
                     case '"': ++dq; return '"';
@@ -1448,6 +1538,15 @@ function gen_code(ast, options) {
                 finally { indentation -= incr; }
         };
 
+        function last_char(str) {
+                str = str.toString();
+                return str.charAt(str.length - 1);
+        };
+
+        function first_char(str) {
+                return str.toString().charAt(0);
+        };
+
         function add_spaces(a) {
                 if (beautify)
                         return a.join(" ");
@@ -1456,7 +1555,8 @@ function gen_code(ast, options) {
                         var next = a[i + 1];
                         b.push(a[i]);
                         if (next &&
-                            ((/[a-z0-9_\x24]$/i.test(a[i].toString()) && /^[a-z0-9_\x24]/i.test(next.toString())) ||
+                            ((is_identifier_char(last_char(a[i])) && (is_identifier_char(first_char(next))
+                                                                      || first_char(next) == "\\")) ||
                              (/[\+\-]$/.test(a[i].toString()) && /^[\+\-]/.test(next.toString())))) {
                                 b.push(" ");
                         }
@@ -1516,7 +1616,7 @@ function gen_code(ast, options) {
         };
 
         function make_num(num) {
-                var str = num.toString(10), a = [ str.replace(/^0\./, ".") ], m;
+                var str = num.toString(10), a = [ str.replace(/^0\./, ".").replace('e+', 'e') ], m;
                 if (Math.floor(num) === num) {
                         if (num >= 0) {
                                 a.push("0x" + num.toString(16).toLowerCase(), // probably pointless
@@ -1541,6 +1641,7 @@ function gen_code(ast, options) {
                 "string": encode_string,
                 "num": make_num,
                 "name": make_name,
+                "debugger": function(){ return "debugger;" },
                 "toplevel": function(statements) {
                         return make_block_statements(statements)
                                 .join(newline + newline);
@@ -1622,9 +1723,9 @@ function gen_code(ast, options) {
                 "dot": function(expr) {
                         var out = make(expr), i = 1;
                         if (expr[0] == "num") {
-                                if (!/\./.test(expr[1]))
+                                if (!/[a-f.]/i.test(out))
                                         out += ".";
-                        } else if (needs_parens(expr))
+                        } else if (expr[0] != "function" && needs_parens(expr))
                                 out = "(" + out + ")";
                         while (i < arguments.length)
                                 out += "." + make_name(arguments[i++]);
@@ -1722,7 +1823,7 @@ function gen_code(ast, options) {
                                         if (p.length == 3) {
                                                 // getter/setter.  The name is in p[0], the arg.list in p[1][2], the
                                                 // body in p[1][3] and type ("get" / "set") in p[2].
-                                                return indent(make_function(p[0], p[1][2], p[1][3], p[2]));
+                                                return indent(make_function(p[0], p[1][2], p[1][3], p[2], true));
                                         }
                                         var key = p[0], val = parenthesize(p[1], "seq");
                                         if (options.quote_keys) {
@@ -1741,6 +1842,7 @@ function gen_code(ast, options) {
                         return obj_needs_parens ? "(" + out + ")" : out;
                 },
                 "regexp": function(rx, mods) {
+                        if (options.ascii_only) rx = to_ascii(rx);
                         return "/" + rx + "/" + mods;
                 },
                 "array": function(elements) {
@@ -1751,7 +1853,9 @@ function gen_code(ast, options) {
                         })), "]" ]);
                 },
                 "stat": function(stmt) {
-                        return make(stmt).replace(/;*\s*$/, ";");
+                        return stmt != null
+                                ? make(stmt).replace(/;*\s*$/, ";")
+                                : ";";
                 },
                 "seq": function() {
                         return add_commas(MAP(slice(arguments), make));
@@ -1764,6 +1868,9 @@ function gen_code(ast, options) {
                 },
                 "atom": function(name) {
                         return make_name(name);
+                },
+                "directive": function(dir) {
+                        return make_string(dir) + ";";
                 }
         }, function(){ return make(ast) });
 
@@ -1799,24 +1906,24 @@ function gen_code(ast, options) {
                 return make(th);
         };
 
-        function make_function(name, args, body, keyword) {
+        function make_function(name, args, body, keyword, no_parens) {
                 var out = keyword || "function";
                 if (name) {
                         out += " " + make_name(name);
                 }
                 out += "(" + add_commas(MAP(args, make_name)) + ")";
                 out = add_spaces([ out, make_block(body) ]);
-                return needs_parens(this) ? "(" + out + ")" : out;
+                return (!no_parens && needs_parens(this)) ? "(" + out + ")" : out;
         };
 
         function must_has_semicolon(node) {
                 switch (node[0]) {
                     case "with":
                     case "while":
-                        return empty(node[2]); // `with' or `while' with empty body?
+                        return empty(node[2]) || must_has_semicolon(node[2]);
                     case "for":
                     case "for-in":
-                        return empty(node[4]); // `for' with empty body?
+                        return empty(node[4]) || must_has_semicolon(node[4]);
                     case "if":
                         if (empty(node[2]) && !node[3]) return true; // `if' with empty `then' and no `else'
                         if (node[3]) {
@@ -1824,6 +1931,8 @@ function gen_code(ast, options) {
                                 return must_has_semicolon(node[3]); // dive into the `else' branch
                         }
                         return must_has_semicolon(node[2]); // dive into the `then' branch
+                    case "directive":
+                        return true;
                 }
         };
 
@@ -2003,4 +2112,7 @@ exports.MAP = MAP;
 // keep this last!
 exports.ast_squeeze_more = require("./squeeze-more").ast_squeeze_more;
 
+// Local variables:
+// js-indent-level: 8
+// End:
 });
